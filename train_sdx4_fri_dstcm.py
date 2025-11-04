@@ -436,6 +436,8 @@ class FRI_DSTCM_worker:
         lr_seq_neighbors: List[torch.Tensor],
         hr_seq_neighbors: List[torch.Tensor],
         center_idx: int,
+        center_z_t: torch.Tensor,
+        center_eps: torch.Tensor,
         ):
         """
         完整时序 teacher-forcing：
@@ -450,19 +452,28 @@ class FRI_DSTCM_worker:
 
         # ===== (1) Teacher-forcing 所有邻帧 j =====
         with torch.no_grad(), self.autocast_context:
-            for lr_j, hr_j in zip(lr_seq_neighbors, hr_seq_neighbors):
-                # encode & 加噪
-                x0_j = vae_encode_img(self.pipe, hr_j)
-                eps_j = torch.randn_like(x0_j)
-                z_j_t = a_bar.sqrt().view(B,1,1,1)*x0_j + (1.-a_bar).sqrt().view(B,1,1,1)*eps_j
-                # latent 需要 scale_model_input (训练里原本没做)
+            for idx, (lr_j, hr_j) in enumerate(zip(lr_seq_neighbors, hr_seq_neighbors)):
+                if idx == center_idx:
+                    z_j_t = center_z_t
+                    eps_j = center_eps
+                else:
+                    # encode & 加噪
+                    x0_j = vae_encode_img(self.pipe, hr_j)
+                    eps_j = torch.randn_like(x0_j)
+                    z_j_t = a_bar.sqrt().view(B,1,1,1)*x0_j + (1.-a_bar).sqrt().view(B,1,1,1)*eps_j
+                    
+                z_j_t_scaled = self.pipe.scheduler.scale_model_input(
+                        z_j_t.to(self.pipe.unet.dtype), t_int
+                    )
+
 
                 #  lr_j 也要先从 0~1 转为 [-1,1] 再 resize
                 lr_j_norm = lr_j * 2 - 1
 
                 # 拼接 LR → 7ch
                 lr_lat = F.interpolate(lr_j_norm, size=z_j_t.shape[-2:], mode="bilinear", align_corners=False)
-                z_in = torch.cat([z_j_t, lr_lat], dim=1)
+                # z_in = torch.cat([z_j_t, lr_lat], dim=1)
+                z_in = torch.cat([z_j_t_scaled, lr_lat], dim=1)
                 # 预测 ε̂_{j,t}
                 pred_eps_j = self.pipe.unet(sample=z_in.to(dtype=self.pipe.unet.dtype), 
                                             timestep=t_int, 
@@ -484,24 +495,29 @@ class FRI_DSTCM_worker:
                 center_idx=center_idx,
             )
 
-            # ===== (3) 计算中心帧 i 的 ε̂_{i,t} =====
+            # ===== (3) 计算中心帧 i 的 ε̂_{i,t}, i == center_idx =====
             with self.autocast_context:
                 z_i_t = z_t_list[center_idx]                   # 原始 latent
+                z_i_t_scaled = self.pipe.scheduler.scale_model_input(
+                        z_i_t.to(self.pipe.unet.dtype), t_int
+                    )
+
 
                 lr_i = lr_seq_neighbors[center_idx]
                 lr_i_norm = lr_i * 2 - 1
                 lr_i_lat = F.interpolate(lr_i_norm, size=z_i_t.shape[-2:], mode="bilinear", align_corners=False)
 
-                z_i_7ch = torch.cat([z_i_t, lr_i_lat], dim=1)
+                # z_i_7ch = torch.cat([z_i_t, lr_i_lat], dim=1)
+                z_i_7ch = torch.cat([z_i_t_scaled, lr_i_lat], dim=1)
                 z_i_7ch = z_i_7ch.to(dtype=self.pipe.unet.dtype)
-                pred_eps_i_t = self.pipe.unet(sample=z_i_7ch, 
+                pred_eps_i = self.pipe.unet(sample=z_i_7ch, 
                                               timestep=t_int, 
                                               encoder_hidden_states=self.null_text_emb[:z_i_7ch.shape[0]], 
                                               class_labels=None).sample
         finally:
             # ===== (4) 清理 hook =====
             real_wrapper.clear()
-        return pred_eps_i_t
+        return pred_eps_i
 
 
     # ---------- eval ----------
@@ -513,7 +529,6 @@ class FRI_DSTCM_worker:
 
 
     def training_epoch(self, epoch):
-        self.pipe.unet.train()
         total_loss = 0.0
         denoise_loss_epoch = 0.0
         band_loss_epoch = 0.0
@@ -537,23 +552,25 @@ class FRI_DSTCM_worker:
             lr_seq_neighbors = [x.to(device, non_blocking=True) for x in lr_seq_neighbors] # 
 
             with torch.no_grad():
-                x0 = vae_encode_img(self.pipe, hr_center)
+                x0_center = vae_encode_img(self.pipe, hr_center)
 
-            t_int = sample_timesteps(self.pipe.scheduler, x0.shape[0], device)
-            z_t, eps_target, a_bar = construct_noisy_latent_and_etarget(x0, t_int, self.pipe.scheduler, device)
+            t_int = sample_timesteps(self.pipe.scheduler, x0_center.shape[0], device)
+            center_z_t, center_eps_target, a_bar = construct_noisy_latent_and_etarget(x0_center, t_int, self.pipe.scheduler, device)
 
             with self.accelerator.accumulate(self.wrapper):
-                pred_eps = self.training_step_with_injection(
+                center_eps_pred = self.training_step_with_injection(
                     t_int=t_int,
                     a_bar=a_bar,
                     lr_seq_neighbors=lr_seq_neighbors,
                     hr_seq_neighbors=hr_seq_neighbors,
                     center_idx=center_idx,
+                    center_z_t=center_z_t,
+                    center_eps=center_eps_target,
                 )
 
                 loss_denoise = F.mse_loss(
-                    pred_eps.to(torch.float32),
-                    eps_target.to(torch.float32)
+                    center_eps_pred.to(torch.float32),
+                    center_eps_target.to(torch.float32)
                 )
 
                 denoise_loss_epoch += loss_denoise.item()
@@ -563,10 +580,10 @@ class FRI_DSTCM_worker:
                     with self.autocast_context:
                         real_wrapper = self.accelerator.unwrap_model(self.wrapper)
                         # ε→x0
-                        x0_hat = real_wrapper.x0_from_eps(z_t, pred_eps, a_bar).to(torch.float32)
+                        center_x0_hat = real_wrapper.x0_from_eps(center_z_t, center_eps_pred, a_bar).to(torch.float32)
                         with torch.no_grad():
-                            hr_pred = vae_decode_latent(self.pipe, x0_hat).to(torch.float32)  # 不记录显存
-                        loss_band = self.band_reg(hr_pred, hr_center.to(torch.float32))
+                            center_hr_pred = vae_decode_latent(self.pipe, center_x0_hat).to(torch.float32)  # 不记录显存
+                        loss_band = self.band_reg(center_hr_pred, hr_center.to(torch.float32))
                         band_loss_epoch += loss_band.item()
                     loss = loss + self.cfg.band_weight * loss_band
 
@@ -642,7 +659,8 @@ class FRI_DSTCM_worker:
         timesteps = self.pipe.scheduler.timesteps  # e.g. [999, 980, ..., 0]        
         alphas_cumprod = self.pipe.scheduler.alphas_cumprod.to(device)
 
-        for t in timesteps:
+        import tqdm
+        for t in tqdm.tqdm(timesteps, desc="DDIM Inference", disable=not self.accelerator.is_main_process):
             # ---- 1) scheduler 用标量时间步；UNet 用 batch 版本 ----
             t_scalar = int(t.item()) if isinstance(t, torch.Tensor) else int(t)
             t_batch  = torch.full((B,), t_scalar, device=device, dtype=torch.long)
@@ -658,8 +676,9 @@ class FRI_DSTCM_worker:
             for lr_j in lr_neighbors:
                 # (a) LR 归一化到 [-1,1] 并插值到 latent 尺寸
                 lr_j_norm = lr_j * 2 - 1
-                lr_j_lat = F.interpolate(lr_j_norm, size=z_scaled.shape[-2:], mode="bilinear", align_corners=False)
+                lr_j_lat = F.interpolate(lr_j_norm, size=z.shape[-2:], mode="bilinear", align_corners=False)
                 z_in_j = torch.cat([z_scaled, lr_j_lat], dim=1)  # 7ch = [z(4) + LR↑(3)]
+                # z_in_j = torch.cat([z, lr_j_lat], dim=1)  # 7ch = [z(4) + LR↑(3)]
                 pred_eps_j = self.pipe.unet(
                     sample=z_in_j,
                     timestep=t_batch,
@@ -683,8 +702,11 @@ class FRI_DSTCM_worker:
                 lr_i = lr_neighbors[center_idx]
                 lr_i_norm = lr_i * 2 - 1
 
-                lr_i_lat = F.interpolate(lr_i_norm, size=z_scaled.shape[-2:], mode="bilinear", align_corners=False)
-                z_in_i = torch.cat([z_scaled, lr_i_lat], dim=1)
+                lr_i_lat = F.interpolate(lr_i_norm, size=z.shape[-2:], mode="bilinear", align_corners=False)
+                z_in_i = torch.cat([z_scaled, lr_i_lat.to(dtype=z_scaled.dtype)], dim=1)
+                z_in_i = z_in_i.to(dtype=self.pipe.unet.dtype)
+
+                # z_in_i = torch.cat([z, lr_i_lat], dim=1)
                 pred_eps_inj = self.pipe.unet(
                     sample=z_in_i,
                     timestep=t_batch,
@@ -703,9 +725,9 @@ class FRI_DSTCM_worker:
 
         # print("latent after step:", z.shape) #torch.Size([2, 4, 32, 32])
         #  解码回图像
-        I_pred = vae_decode_latent(self.pipe, z.to(self.pipe.unet.dtype))
-        return I_pred, center_idx
-    
+        sr_center = vae_decode_latent(self.pipe, z.to(self.pipe.unet.dtype))
+        return sr_center, center_idx
+
     @torch.no_grad()
     def eval_step_per_sequence(self, lr_seq_full, num_inference_steps=75):
         """
@@ -720,9 +742,7 @@ class FRI_DSTCM_worker:
         for i in range(T):
             # 取得以第 i 帧为中心的 K 邻域
             lr_neighbors, center_idx = pick_neighbors_for_eval(lr_seq_full, i, K)
-            lr_center = lr_neighbors[center_idx]
 
-            # 这里必须把 center_idx 替换为真实帧序号 i：
             sr_center_pred, _ = self.eval_step_per_frame(lr_neighbors, num_inference_steps)
 
             sr_results.append(sr_center_pred)
@@ -763,12 +783,12 @@ class FRI_DSTCM_worker:
                     sr_img = sr_seq_full[t][0]  # [3,H,W]
                     sr_img_np = (sr_img.cpu().numpy().transpose(1,2,0) * 255).astype(np.uint8)
                     img_pil = Image.fromarray(sr_img_np)
-                    img_pil.save(os.path.join(self.dump_dir, f"SR_{step:03d}_{t:03d}.png"))
+                    img_pil.save(os.path.join(self.dump_dir, f"{step:03d}_{t:03d}_SR.png"))
 
                     lr_img = lr_seq_full[t][0]  # [3,H,W]
                     lr_img_np = (lr_img.cpu().numpy().transpose(1,2,0) * 255).astype(np.uint8)
                     img_pil = Image.fromarray(lr_img_np)
-                    img_pil.save(os.path.join(self.dump_dir, f"LR_{step:03d}_{t:03d}.png"))
+                    img_pil.save(os.path.join(self.dump_dir, f"{step:03d}_{t:03d}_LR.png"))
 
                         # 日志输出
             if self.accelerator.is_main_process and step % self.cfg.log_every == 0:
