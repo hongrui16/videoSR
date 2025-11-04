@@ -14,8 +14,8 @@ class LapPyramid(nn.Module):
         self.channels = channels
 
     def gaussian(self, x):
-        k = self.kernel.repeat(self.channels, 1, 1, 1).to(dtype=x.dtype)
-        return F.conv2d(x, k, padding=2, groups=self.channels)
+        kernel = self.kernel.repeat(self.channels, 1, 1, 1).to(dtype=x.dtype, device=x.device)
+        return F.conv2d(x, kernel, padding=2, groups=self.channels)
 
 
     def forward(self, x: torch.Tensor):

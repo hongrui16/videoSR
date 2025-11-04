@@ -32,6 +32,113 @@ class FlowBackend(nn.Module):
 
 
 
+class TVRaftBackend(FlowBackend):
+    def __init__(self, weights: Raft_Small_Weights = Raft_Small_Weights.DEFAULT, device=None):
+        """
+        RAFT-Small 光流后端（torchvision 版）。
+        - 模型与预处理均来自 torchvision.models.optical_flow
+        - 模型在初始化时设为 eval，并冻结梯度
+        """
+        super().__init__()
+        self.model = raft_small(weights=weights)
+        if device is not None:
+            self.model = self.model.to(device)
+        self.model.eval()
+        for p in self.model.parameters():
+            p.requires_grad_(False)
+
+        # torchvision 的 RAFT 预处理：将 [0,1] 归一化为 [-1,1] 等
+        # 注意：当 weights 为 None 时没有 transforms，这里做个兜底
+        self.transforms = weights.transforms() if hasattr(weights, "transforms") else None
+        
+        
+    @torch.no_grad()
+    def forward(self, lr_j: torch.Tensor, lr_i: torch.Tensor) -> torch.Tensor:
+        """
+        计算从邻帧 j 到目标帧 i 的光流（单位 = 原始 LR 像素位移）。
+        自动处理 <128×128 时的上采样需求。
+        """
+        assert lr_j.ndim == 4, "Input must be [B,3,H,W]"
+        B, C, H, W = lr_j.shape
+
+        # ============ 1. 如果尺寸太小（<128），先放大到128，再算光流 ============
+        need_resize = (H < 128 or W < 128)
+        if need_resize:
+            lr_j_in = F.interpolate(lr_j, size=(128, 128), mode="bilinear", align_corners=False)
+            lr_i_in = F.interpolate(lr_i, size=(128, 128), mode="bilinear", align_corners=False)
+        else:
+            lr_j_in, lr_i_in = lr_j, lr_i
+
+        # ============ 2. pad保证可以被8整除 ============
+        B2, C2, H2, W2 = lr_j_in.shape
+        pad_h = (8 - H2 % 8) % 8
+        pad_w = (8 - W2 % 8) % 8
+        if pad_h or pad_w:
+            lr_j_pad = F.pad(lr_j_in, (0, pad_w, 0, pad_h), mode="replicate")
+            lr_i_pad = F.pad(lr_i_in, (0, pad_w, 0, pad_h), mode="replicate")
+        else:
+            lr_j_pad, lr_i_pad = lr_j_in, lr_i_in
+
+        # ============ 3. transforms（归一化） ============
+        if self.transforms is not None:
+            s_in, t_in = self.transforms(lr_j_pad, lr_i_pad)
+        else:
+            s_in = lr_j_pad * 2 - 1
+            t_in = lr_i_pad * 2 - 1
+
+        s_in = s_in.to(lr_j.device)
+        t_in = t_in.to(lr_j.device)
+
+        # ============ 4. RAFT 前向 ============ 
+        try:
+            outs = self.model(s_in, t_in, iters=12, test_mode=True)
+        except TypeError:
+            outs = self.model(s_in, t_in)
+
+        flow = outs[-1] if isinstance(outs, (list, tuple)) else outs  # [B,2,H',W']
+
+        # ============ 5. 如果放大过 → 缩回原LR大小 + 缩放光流幅度 ============
+        if need_resize:
+            # flow是基于128×128的像素位移，要缩回 H×W 尺寸，并调整幅值
+            flow = F.interpolate(flow, size=(H, W), mode="bilinear", align_corners=False)
+            scale_x = float(W) / 128.0
+            scale_y = float(H) / 128.0
+            flow[:, 0] *= scale_x  # x方向
+            flow[:, 1] *= scale_y  # y方向
+
+        else:
+            # 如果没放大，只需要cut出补边的部分
+            if pad_h or pad_w:
+                flow = flow[..., :H2, :W2]
+
+        return flow.to(lr_j.dtype)
+
+
+
+def grid_warp(img: torch.Tensor, flow_xy: torch.Tensor):
+    """
+    双线性采样：img 按 flow 像素位移（x,y）进行变形到 target 网格。
+    img:  [B,C,H,W]  —— HR 或 LR 都可，但 flow 应与它同分辨率
+    flow: [B,2,H,W] —— 像素位移，flow[:,0] 是 x（宽度方向），flow[:,1] 是 y（高度方向）
+    """
+    B, C, H, W = img.shape
+    # 构建归一化光栅坐标
+    dtype = img.dtype
+    yy, xx = torch.meshgrid(
+        torch.arange(H, device=img.device, dtype=torch.float32),
+        torch.arange(W, device=img.device, dtype=torch.float32),
+        indexing="ij",
+    )
+    # 像素坐标加位移 → 归一化到 [-1,1]
+    x = (xx[None, ...] + flow_xy[:, 0].float()) / max(W - 1, 1) * 2 - 1
+    y = (yy[None, ...] + flow_xy[:, 1].float()) / max(H - 1, 1) * 2 - 1
+    grid = torch.stack([x, y], dim=-1)  # [B,H,W,2] float32
+
+    out = F.grid_sample(img.to(dtype=torch.float32), grid, mode="bilinear", padding_mode="border", align_corners=False)
+    out = out.to(dtype=dtype)
+    return out
+
+
 # ========== Basics ==========
 def timestep_embedding(timesteps: torch.Tensor, dim: int, max_period: int = 10_000):
     half = dim // 2
@@ -169,7 +276,11 @@ class FRI_DSTCM_Conditioner(nn.Module):
         t_emb  = t_emb.to(dtype=cond_i.dtype)
         snr_emb = snr_emb.to(dtype=cond_i.dtype)
 
-        low, mid, high = self.lap(cond_i)
+        cond_i_f32 = cond_i.float()
+        low, mid, high = self.lap(cond_i_f32)
+        low = low.to(dtype=cond_i.dtype)
+        mid = mid.to(dtype=cond_i.dtype)
+        high = high.to(dtype=cond_i.dtype)
         F_low = self.enc_low(low)
         F_mid = self.enc_mid(mid)
         F_high = self.enc_high(high)
@@ -182,18 +293,20 @@ class FRI_DSTCM_Conditioner(nn.Module):
             fh = self._resize(feats["high"], spec.factor)
             residuals[name] = self.proj_low[name](fl) + self.proj_mid[name](fm) + self.proj_high[name](fh)
         return residuals
-
-class UNetMultiScaleInjector:
+    
+    
+class UNetMultiScaleInjector(nn.Module):
     def __init__(self, unet, scale_keys: List[str]):
+        super().__init__()
         self.unet = unet
-        self.scale_keys = scale_keys  # e.g. ["s2","s4","s8"]
+        self.scale_keys = scale_keys        # e.g. ["s2","s4","s8"]
         self._probes, self._shapes, self._hooks = [], {}, []
-        self._proj_convs = nn.ModuleDict()  # ★ 新增：保存每个注入点的1x1卷积映射器
+        self._proj_convs = nn.ModuleDict()  # 保存每个注入点的 1×1 conv
 
     def _probe_hook(self, name):
         def fn(module, inputs):
             x = inputs[0]
-            self._shapes[name] = x.shape[-2:]  # 只记录H,W
+            self._shapes[name] = x.shape[-2:]  # (H,W)
         return fn
 
     def probe(self):
@@ -202,37 +315,41 @@ class UNetMultiScaleInjector:
                 h = res.register_forward_pre_hook(self._probe_hook(f"up{i}_res{j}"))
                 self._probes.append(h)
 
-    def resolve(self):
-        # 分辨率从高到低排序，对应 scale_keys = ["s2","s4","s8"]
+    def resolve(self, scale_specs: Dict[str, "ScaleSpec"]):
+        # 1) 由探测得到的分辨率从大到小排序，并映射到 scale_keys
         items = sorted(self._shapes.items(), key=lambda kv: kv[1][0]*kv[1][1], reverse=True)
         mapping = {}
         for (name, _), key in zip(items, self.scale_keys):
             mapping[name] = key
-        # 清理probe hook
+
+        # 清理 probe hooks
         for h in self._probes:
             h.remove()
         self._probes.clear()
         self._mapping = mapping
 
+        # 2) ★ 在这里“实体化”所有需要的 1×1 conv（不再懒创建）
+        for name, key in self._mapping.items():
+            # name 形如 "up{i}_res{j}"
+            i = int(name.split('_')[0][2:])
+            j = int(name.split('_')[1][3:])
+            out_ch = self.unet.up_blocks[i].resnets[j].out_channels  # 输出通道
+            in_ch  = scale_specs[key].ch                              # Conditioner 对该尺度的通道
+            conv_key = f"{key}_{name}"
+            if conv_key not in self._proj_convs:
+                self._proj_convs[conv_key] = nn.Conv2d(in_ch, out_ch, kernel_size=1)
+
     def register_injection(self, residuals: Dict[str, torch.Tensor]):
         def make_hook(name, key):
             def hook(module, inputs, output):
                 R = residuals[key].to(dtype=output.dtype, device=output.device)
-
-                # 尺寸匹配（空间分辨率）
+                # 尺寸对齐
                 if R.shape[-2:] != output.shape[-2:]:
                     R = F.interpolate(R, size=output.shape[-2:], mode="bilinear", align_corners=False)
-
-                # 通道匹配（输出通道数 vs R通道数）
-                out_ch = output.shape[1]
-                in_ch = R.shape[1]
-                conv_key = f"{key}_{name}"
-                if conv_key not in self._proj_convs:
-                    # 延迟创建 1x1 卷积
-                    self._proj_convs[conv_key] = nn.Conv2d(in_ch, out_ch, kernel_size=1).to(output.device, output.dtype)
-
-                R = self._proj_convs[conv_key](R)
-                return output + R  # 残差注入
+                # 通道映射（已提前创建）
+                conv = self._proj_convs[f"{key}_{name}"].to(device=output.device, dtype=output.dtype)
+                R = conv(R)
+                return output + R
             return hook
 
         for i, up in enumerate(self.unet.up_blocks):
@@ -248,134 +365,32 @@ class UNetMultiScaleInjector:
             h.remove()
         self._hooks.clear()
         self._shapes.clear()
+
         
-        
-class TVRaftBackend(FlowBackend):
-    def __init__(self, weights: Raft_Small_Weights = Raft_Small_Weights.DEFAULT, device=None):
-        """
-        RAFT-Small 光流后端（torchvision 版）。
-        - 模型与预处理均来自 torchvision.models.optical_flow
-        - 模型在初始化时设为 eval，并冻结梯度
-        """
-        super().__init__()
-        self.model = raft_small(weights=weights)
-        if device is not None:
-            self.model = self.model.to(device)
-        self.model.eval()
-        for p in self.model.parameters():
-            p.requires_grad_(False)
-
-        # torchvision 的 RAFT 预处理：将 [0,1] 归一化为 [-1,1] 等
-        # 注意：当 weights 为 None 时没有 transforms，这里做个兜底
-        self.transforms = weights.transforms() if hasattr(weights, "transforms") else None
-        
-        
-    @torch.no_grad()
-    def forward(self, lr_j: torch.Tensor, lr_i: torch.Tensor) -> torch.Tensor:
-        """
-        计算从邻帧 j 到目标帧 i 的光流（单位 = 原始 LR 像素位移）。
-        自动处理 <128×128 时的上采样需求。
-        """
-        assert lr_j.ndim == 4, "Input must be [B,3,H,W]"
-        B, C, H, W = lr_j.shape
-
-        # ============ 1. 如果尺寸太小（<128），先放大到128，再算光流 ============
-        need_resize = (H < 128 or W < 128)
-        if need_resize:
-            lr_j_in = F.interpolate(lr_j, size=(128, 128), mode="bilinear", align_corners=False)
-            lr_i_in = F.interpolate(lr_i, size=(128, 128), mode="bilinear", align_corners=False)
-        else:
-            lr_j_in, lr_i_in = lr_j, lr_i
-
-        # ============ 2. pad保证可以被8整除 ============
-        B2, C2, H2, W2 = lr_j_in.shape
-        pad_h = (8 - H2 % 8) % 8
-        pad_w = (8 - W2 % 8) % 8
-        if pad_h or pad_w:
-            lr_j_pad = F.pad(lr_j_in, (0, pad_w, 0, pad_h), mode="replicate")
-            lr_i_pad = F.pad(lr_i_in, (0, pad_w, 0, pad_h), mode="replicate")
-        else:
-            lr_j_pad, lr_i_pad = lr_j_in, lr_i_in
-
-        # ============ 3. transforms（归一化） ============
-        if self.transforms is not None:
-            s_in, t_in = self.transforms(lr_j_pad, lr_i_pad)
-        else:
-            s_in = lr_j_pad * 2 - 1
-            t_in = lr_i_pad * 2 - 1
-
-        s_in = s_in.to(lr_j.device)
-        t_in = t_in.to(lr_j.device)
-
-        # ============ 4. RAFT 前向 ============ 
-        try:
-            outs = self.model(s_in, t_in, iters=12, test_mode=True)
-        except TypeError:
-            outs = self.model(s_in, t_in)
-
-        flow = outs[-1] if isinstance(outs, (list, tuple)) else outs  # [B,2,H',W']
-
-        # ============ 5. 如果放大过 → 缩回原LR大小 + 缩放光流幅度 ============
-        if need_resize:
-            # flow是基于128×128的像素位移，要缩回 H×W 尺寸，并调整幅值
-            flow = F.interpolate(flow, size=(H, W), mode="bilinear", align_corners=False)
-            scale_x = float(W) / 128.0
-            scale_y = float(H) / 128.0
-            flow[:, 0] *= scale_x  # x方向
-            flow[:, 1] *= scale_y  # y方向
-
-        else:
-            # 如果没放大，只需要cut出补边的部分
-            if pad_h or pad_w:
-                flow = flow[..., :H2, :W2]
-
-        return flow.to(lr_j.dtype)
-
-
-
-def grid_warp(img: torch.Tensor, flow_xy: torch.Tensor):
-    """
-    双线性采样：img 按 flow 像素位移（x,y）进行变形到 target 网格。
-    img:  [B,C,H,W]  —— HR 或 LR 都可，但 flow 应与它同分辨率
-    flow: [B,2,H,W] —— 像素位移，flow[:,0] 是 x（宽度方向），flow[:,1] 是 y（高度方向）
-    """
-    B, C, H, W = img.shape
-    # 构建归一化光栅坐标
-    dtype = img.dtype
-    yy, xx = torch.meshgrid(
-        torch.arange(H, device=img.device, dtype=dtype),
-        torch.arange(W, device=img.device, dtype=dtype),
-        indexing="ij",
-    )
-    # 像素坐标加位移 → 归一化到 [-1,1]
-    x = (xx[None, ...] + flow_xy[:, 0, ...]) / max(W - 1, 1) * 2 - 1
-    y = (yy[None, ...] + flow_xy[:, 1, ...]) / max(H - 1, 1) * 2 - 1
-    grid = torch.stack([x, y], dim=-1)  # [B,H,W,2]
-    return F.grid_sample(img, grid, mode="bilinear", padding_mode="border", align_corners=False)
-
-
 
 class ReferenceBuilder:
     """
     解码-only + 光流 warp +（可选）QRM 打分。
     注意：全程 no_grad；像素不回传。
     """
-    def __init__(self, vae_decode_fn, flow_estimator=None, use_qrm=False, device='cpu'):
+    def __init__(self, vae_decode_fn, flow_estimator=None, use_qrm=False, device='cpu', weights_precision=torch.float32):
         self.vae_decode = vae_decode_fn
-        self.flow = flow_estimator
+        self.flow_estimator = flow_estimator
         self.use_qrm = use_qrm
         self.qrm = QRM(device=device) if use_qrm else None
+        self.qrm = self.qrm.to(weights_precision) if use_qrm else None
+        self.flow_dtype = next(flow_estimator.parameters()).dtype if flow_estimator is not None else torch.float32
 
     @torch.no_grad()
     def __call__(
         self,
-        pred_x0_list: List[torch.Tensor],  # list of [B,4,h,w] (latent x0)
-        lr_list: List[torch.Tensor],       # list of [B,3,H,W] (LR RGB, 0-1)
-        center_idx: int = 0,
+        pred_x0_list: List[torch.Tensor],  # list of [B,4,h,w] (latent x0), center_idx latent and its left and right latent.
+        lr_list: List[torch.Tensor],       # list of [B,3,H,W] (LR RGB, 0-1), center_idx lr frame and its left and right neighbor frames
+        center_idx: int = 0,# center index in the above lists
         topk: Optional[int] = None,
     ) -> torch.Tensor:
         # 1) 解码所有 x0 → HR RGB [0,1]
-        hr_list = [self.vae_decode(z) for z in pred_x0_list]  # each [B,3,H,W_hr]
+        hr_list = [self.vae_decode(z) for z in pred_x0_list]  # each [B,3,H,W_hr], generated hr frames at center_idx and its neighbor indices
         B, _, H_hr, W_hr = hr_list[center_idx].shape
 
         # 2) 构造到 HR 的 flow：先在 LR 上估计，再上采到 HR，并做像素单位缩放
@@ -384,6 +399,7 @@ class ReferenceBuilder:
         scale_y = H_hr / max(H_lr, 1)
         scale_x = W_hr / max(W_lr, 1)
 
+        dtype = hr_list[0].dtype
         warped, qs = [], []
         for k, (hrk, lrk) in enumerate(zip(hr_list, lr_list)):
             if k == center_idx:
@@ -391,13 +407,13 @@ class ReferenceBuilder:
                 qs.append(torch.ones(B, 1, H_hr, W_hr, device=hrk.device, dtype=hrk.dtype))
                 continue
 
-            flow_lr = self.flow(lrk, tgt_lr)  # [B,2,H_lr,W_lr], 像素位移（LR）
-            flow_hr = F.interpolate(flow_lr, size=(H_hr, W_hr), mode="bilinear", align_corners=False)
+            flow_lr = self.flow_estimator(lrk.to(self.flow_dtype), tgt_lr.to(self.flow_dtype))  # [B,2,H_lr,W_lr], 像素位移（LR）
+            flow_hr = F.interpolate(flow_lr.float(), size=(H_hr, W_hr), mode="bilinear", align_corners=False)
             flow_hr[:, 0, ...] *= scale_x
             flow_hr[:, 1, ...] *= scale_y
 
-            flow_hr = flow_hr.to(dtype=hrk.dtype, device=hrk.device)
             hrk_w = grid_warp(hrk, flow_hr)
+            hrk_w = hrk_w.to(dtype=hrk.dtype)
 
             if self.use_qrm:
                 lr_up = F.interpolate(tgt_lr, size=(H_hr, W_hr), mode="bilinear", align_corners=False)
@@ -431,7 +447,14 @@ class SDX4_FRI_DSTCM_Wrapper(nn.Module):
         super().__init__()
         self.pipe = pipe
         self.unet = pipe.unet.to(device)
+        self.unet.eval()  # 冻结 UNet
+        for p in self.unet.parameters():
+            p.requires_grad_(False)
         self.vae = pipe.vae.to(device)
+        self.vae.eval()  # 冻结 VAE
+        for p in self.vae.parameters():
+            p.requires_grad_(False)
+
         self.logger = logger
         self.accelerator = accelerator
         B = 1  # dummy batch size for null text embedding, only used during initialization
@@ -440,7 +463,10 @@ class SDX4_FRI_DSTCM_Wrapper(nn.Module):
 
         self.logger.info(f"null_encoder_hidden_states shape: {self.null_encoder_hidden_states.shape}", main_process_only=self.accelerator.is_main_process)
 
-        self.flow_estimator = TVRaftBackend(device=next(self.unet.parameters()).device)
+        self.flow_estimator = TVRaftBackend(device=next(self.unet.parameters()).device).to(dtype=torch.float32)
+        self.flow_estimator.eval()
+        for p in self.flow_estimator.parameters():
+            p.requires_grad_(False)
 
         
         # 以 factor 升序构造 key（面积从大到小）—— FIX: 确保与 resolve() 的排序一致
@@ -454,9 +480,11 @@ class SDX4_FRI_DSTCM_Wrapper(nn.Module):
 
 
         self.conditioner = FRI_DSTCM_Conditioner(n_rgbk=3 * K, scale_specs=scale_specs)
+        self.conditioner.to(device).to(self.unet.dtype)
 
         
         self.snr_mlp = nn.Sequential(nn.Linear(1, 256), nn.SiLU(), nn.Linear(256, 256))
+        self.snr_mlp.to(device).to(self.unet.dtype)
 
         def vae_decode_fn(latent_4chw):
             latent_4chw = latent_4chw.to(dtype=self.pipe.vae.dtype, device=next(self.unet.parameters()).device)
@@ -465,11 +493,13 @@ class SDX4_FRI_DSTCM_Wrapper(nn.Module):
             )[0]  # [-1,1]
             return (out.clamp(-1, 1) + 1) / 2.0
 
-        self.ref_builder = ReferenceBuilder(vae_decode_fn, flow_estimator=self.flow_estimator, use_qrm=use_qrm, device=next(self.unet.parameters()).device)
+        self.ref_builder = ReferenceBuilder(vae_decode_fn, flow_estimator=self.flow_estimator, use_qrm=use_qrm, device=next(self.unet.parameters()).device, weights_precision=self.unet.dtype)
         self.K = K
         
         # 关键：scale_keys 以 factor 升序（面积从大到小）传入
         self.injector = UNetMultiScaleInjector(self.unet, scale_keys=list(scale_specs.keys()))
+
+        self.injector.to(device).to(self.unet.dtype)
         self.injector.probe()
 
         with torch.no_grad():
@@ -485,13 +515,23 @@ class SDX4_FRI_DSTCM_Wrapper(nn.Module):
                           timestep=t0, 
                           encoder_hidden_states=self.null_encoder_hidden_states[:B],
                           class_labels=None)
-        self.injector.resolve()
-        self._resolved = True
+        self.injector.resolve(scale_specs)
+
+        self.unet.eval()
+        for p in self.unet.parameters():
+            p.requires_grad_(False)
+            
+        for name, param in self.injector.named_parameters():
+            if "proj_convs" in name:
+                param.requires_grad_(True)
+            else:
+                param.requires_grad_(False)
+
 
 
 
     @staticmethod
-    def x0_from_eps(z_t: torch.Tensor, pred_eps: torch.Tensor, alpha_bar_t: torch.Tensor) -> torch.Tensor:
+    def x0_from_eps(z_t, pred_eps, alpha_bar_t):
         """
         由 ε 预测反推 x0：
             z_t = sqrt(ā) * x0 + sqrt(1-ā) * ε
@@ -501,10 +541,14 @@ class SDX4_FRI_DSTCM_Wrapper(nn.Module):
             pred_eps:   [B,4,h,w]
             alpha_bar_t:[B]
         """
-        alpha_bar_t = alpha_bar_t.to(dtype=z_t.dtype)
+        z_t = z_t.to(torch.float32)
+        pred_eps = pred_eps.to(torch.float32)
+        alpha_bar_t = alpha_bar_t.to(torch.float32)
+
         a_sqrt = alpha_bar_t.sqrt()[:, None, None, None]
         one_minus_a_sqrt = (1.0 - alpha_bar_t).sqrt()[:, None, None, None]
-        return (z_t - one_minus_a_sqrt * pred_eps) / a_sqrt
+
+        return (z_t - one_minus_a_sqrt * pred_eps) / a_sqrt  # output fp32
 
 
     def build_and_register(
