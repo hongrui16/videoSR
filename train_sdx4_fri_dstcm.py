@@ -627,7 +627,7 @@ class FRI_DSTCM_worker:
 
     
     @torch.no_grad()
-    def eval_upscale_with_conditioning(self, lr_neighbors: List[torch.Tensor], num_inference_steps=50):
+    def eval_step_per_frame(self, lr_neighbors: List[torch.Tensor], num_inference_steps=50):
         device = self.accelerator.device
         center_idx = len(lr_neighbors) // 2
         B, _, h, w = lr_neighbors[0].shape
@@ -707,7 +707,7 @@ class FRI_DSTCM_worker:
         return I_pred, center_idx
     
     @torch.no_grad()
-    def eval_video(self, lr_seq_full, num_inference_steps=75):
+    def eval_step_per_sequence(self, lr_seq_full, num_inference_steps=75):
         """
         lr_seq_full: List[T] of tensors, each [B,3,H,W]
         return: List[T] of SR results, each [B,3,H,W]
@@ -723,7 +723,7 @@ class FRI_DSTCM_worker:
             lr_center = lr_neighbors[center_idx]
 
             # 这里必须把 center_idx 替换为真实帧序号 i：
-            sr_center_pred, _ = self.eval_upscale_with_conditioning(lr_neighbors, num_inference_steps)
+            sr_center_pred, _ = self.eval_step_per_frame(lr_neighbors, num_inference_steps)
 
             sr_results.append(sr_center_pred)
 
@@ -749,7 +749,7 @@ class FRI_DSTCM_worker:
             hr_seq_full = split_seq(hr_seq)
             # print('shape of lr_seq: ', lr_seq.shape) 
             # print('shape of hr_seq: ', hr_seq.shape)
-            sr_seq_full = self.eval_video(lr_seq_full, num_inference_steps)  # List[T]
+            sr_seq_full = self.eval_step_per_sequence(lr_seq_full, num_inference_steps)  # List[T]
 
             for t in range(len(sr_seq_full)):
                 I_pred = sr_seq_full[t].to(torch.float32)
@@ -758,8 +758,7 @@ class FRI_DSTCM_worker:
                 
                 if self.debug and step >= 2:
                     break
-                
-                    
+                                    
                 if self.dump_sr and self.accelerator.is_main_process:
                     sr_img = sr_seq_full[t][0]  # [3,H,W]
                     sr_img_np = (sr_img.cpu().numpy().transpose(1,2,0) * 255).astype(np.uint8)
