@@ -16,26 +16,6 @@
 module load gnu10
 module load python
 
-# ---- Sanity check & cleanup ----
-unset OMPI_COMM_WORLD_RANK OMPI_COMM_WORLD_LOCAL_RANK OMPI_COMM_WORLD_SIZE
-unset PMI_RANK PMI_SIZE PMI_LOCAL_RANK
-unset LOCAL_RANK RANK WORLD_SIZE
-
-echo "HOST=$(hostname)"
-echo "SLURM_NTASKS=$SLURM_NTASKS  SLURM_GPUS_ON_NODE=$SLURM_GPUS_ON_NODE"
-nvidia-smi -L
-echo "CVD(raw)=${CUDA_VISIBLE_DEVICES@Q}"
-
-python - <<'PY'
-import os, torch
-print("CVD:", repr(os.environ.get("CUDA_VISIBLE_DEVICES")))
-print("device_count:", torch.cuda.device_count())
-print("LOCAL_RANK:", repr(os.environ.get("LOCAL_RANK")), 
-      "RANK:", repr(os.environ.get("RANK")), 
-      "WORLD_SIZE:", repr(os.environ.get("WORLD_SIZE")))
-PY
-
-
 
 source /home/rhong5/py310Torch/bin/activate
 cd /home/rhong5/research_pro/hand_modeling_pro/fsv/vsr
@@ -44,13 +24,13 @@ cd /home/rhong5/research_pro/hand_modeling_pro/fsv/vsr
 PORT=$(( (RANDOM << 8 | RANDOM) & 0xFFFF ))
 echo "Random port: $PORT"
 
+DATASET_NAME="Vimeo-90K"
+unet_weights_precision="fp32"
+
 
 # Launch distributed training with accelerate
 accelerate launch --num_processes=3 --num_machines=1 --machine_rank=0 --main_process_ip=localhost --main_process_port=$PORT \
-    train_sdx4_fri_dstcm.py 2> >(grep -v "absl::InitializeLog" | grep -v "gl_context_egl.cc" | grep -v "gl_context.cc" >&2)
-
-# accelerate launch --num_processes=2 --num_machines=1 --machine_rank=0 --main_process_ip=localhost --main_process_port=12345 \
-#     train_handposeRegressor_dist.py --debug 2> >(grep -v "absl::InitializeLog" | grep -v "gl_context_egl.cc" | grep -v "gl_context.cc" >&2)
+    train_sdx4_fri_dstcm.py --dataset_name=$DATASET_NAME --unet_weights_precision=$unet_weights_precision 2> >(grep -v "absl::InitializeLog" | grep -v "gl_context_egl.cc" | grep -v "gl_context.cc" >&2)
 
 
 # torchrun --nnodes=${NUM_NODES} --nproc_per_node=${GPUS_PER_NODE} train_VAE.py --debug 

@@ -29,7 +29,7 @@ import PIL.Image as Image
 from dataloader.build_dataloader import build_dataloader
 from cond_modules import SDX4_FRI_DSTCM_Wrapper
 from utils.loss import BandConsistencyLoss
-from utils.util import split_seq, pick_neighbors_fixed, pick_neighbors_for_eval
+from utils.util import split_seq, pick_neighbors_fixed, pick_neighbors_for_eval, _to_tensor
 from config.config import Config
 
 def get_autocast_context(accelerator: Accelerator):
@@ -45,10 +45,16 @@ def get_autocast_context(accelerator: Accelerator):
 #  PIPE & VAE HELPERS
 # =======================
 
-def prepare_pipe(cfg, device):
-    if cfg.unet_weights_precision == "fp32":
+def _must_finite(x, tag):
+    if not torch.isfinite(x).all():
+        raise RuntimeError(f"[NaNCheck] {tag}: found non-finite values "
+                           f"(min={x.min().item()}, max={x.max().item()})")
+
+
+def prepare_pipe(unet_weights_precision, device, logger=None):
+    if unet_weights_precision == "fp32":
         weight_dtype = torch.float32
-    elif cfg.unet_weights_precision == "bf16":
+    elif unet_weights_precision == "bf16":
         weight_dtype = torch.bfloat16
     else:
         weight_dtype = torch.float16  # 默认 fp16
@@ -65,31 +71,46 @@ def prepare_pipe(cfg, device):
 
 
     # freeze backbone
-    pipe.unet.requires_grad_(False)
-    pipe.vae.requires_grad_(False)
+
     if hasattr(pipe, "text_encoder"):
+        pipe.text_encoder.eval()
         pipe.text_encoder.requires_grad_(False)
         pipe.text_encoder.to(device)     
     pipe.scheduler = EulerAncestralDiscreteScheduler.from_config(pipe.scheduler.config)
     pipe.to(device=device, dtype=weight_dtype)
     pipe.unet.eval()
-    for p in pipe.unet.parameters():
-        p.requires_grad_(False)
+    pipe.unet.requires_grad_(False)
         
+    pipe.vae.to(device=device, dtype=torch.float32)
     pipe.vae.eval()
-    for p in pipe.vae.parameters():
-        p.requires_grad_(False)
+    pipe.vae.requires_grad_(False)
+
+        
+    if logger is not None:
+        logger.info(f"Pipeline prepared. pipe unet dtype: {next(pipe.unet.parameters()).dtype}", main_process_only=True)
+        logger.info(f"Pipeline prepared. pipe vae dtype: {next(pipe.vae.parameters()).dtype}", main_process_only=True)
+        logger.info(f"Pipeline prepared. pipe text_encoder dtype: {next(pipe.text_encoder.parameters()).dtype}", main_process_only=True)
+    else:
+        print(f"Pipeline prepared. pipe unet dtype: {next(pipe.unet.parameters()).dtype}")  
+        print(f"Pipeline prepared. pipe vae dtype: {next(pipe.vae.parameters()).dtype}")
+        print(f"Pipeline prepared. pipe text_encoder dtype: {next(pipe.text_encoder.parameters()).dtype}")        
     return pipe
 
 @torch.no_grad()
 def vae_encode_img(pipe, img_01: torch.Tensor) -> torch.Tensor:
-    """ img_01 in [0,1], shape [B,3,H,W] -> latent [B,4,h,w] """
-    # print("vae_encode_img input img_01:", img_01.shape) # [B,3,H,W]
-    img = img_01 * 2 - 1
+    """
+    Safe encoding with stable FP32 compute, without permanently changing VAE dtype.
+    """
+    # 1) 输入从 [0,1] -> [-1,1]，并转为 float32
+    img = (img_01 * 2 - 1).to(dtype=torch.float32)
+
+    # 2) 做 encode（FP32下很稳定，不会NaN）
     posterior = pipe.vae.encode(img).latent_dist
-    z = posterior.mean
-    # print("vae_encode_img output z:", z.shape) # [B,4,H//4,W//4]
-    return z * pipe.vae.config.scaling_factor
+    z = posterior.mean * pipe.vae.config.scaling_factor
+
+    return z.to(dtype=torch.float32)  # 输出保持 float32，后面更安全
+
+
 
 @torch.no_grad()
 def vae_decode_latent(pipe, z_4chw: torch.Tensor) -> torch.Tensor:
@@ -122,8 +143,10 @@ def construct_noisy_latent_and_etarget(x0: torch.Tensor, t_int: torch.Tensor, sc
     alphas_cumprod = scheduler.alphas_cumprod.to(device)
     a_bar = alphas_cumprod[t_int].clamp(1e-6, 1.0 - 1e-6)  # [B]
     B = x0.shape[0]
-    eps = torch.randn_like(x0)
-    z_t = a_bar.sqrt().view(B,1,1,1) * x0 + (1. - a_bar).sqrt().view(B,1,1,1) * eps
+    eps = torch.randn_like(x0, dtype=torch.float32)
+    z_t = a_bar.sqrt().view(B,1,1,1).to(torch.float32) * x0.to(torch.float32) + \
+      (1. - a_bar).sqrt().view(B,1,1,1).to(torch.float32) * eps
+
     eps_target = eps
     return z_t, eps_target, a_bar
 
@@ -141,23 +164,23 @@ class FRI_DSTCM_worker:
         self.debug = args.debug        
         self.runtime_mode = args.runtime if args.runtime else cfg.runtime_mode
         self.max_epochs = cfg.max_epochs
-        self.finetune = cfg.finetune
+        self.finetune = cfg.finetune 
         self.dump_sr = args.dump_sr if args.dump_sr else cfg.dump_sr
 
-        if cfg.data_precision == "fp16":
-            self.data_precision = torch.float16
-        elif cfg.data_precision == "bf16":
-            self.data_precision = torch.bfloat16
-        else:
-            self.data_precision = torch.float32
+        # if cfg.data_precision == "fp16":
+        #     self.data_precision = torch.float16
+        # elif cfg.data_precision == "bf16":
+        #     self.data_precision = torch.bfloat16
+        # else:
+        #     self.data_precision = torch.float32
 
         current_timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
         # job_id = str(os.getpid())
         slurm_job_id = os.getenv('SLURM_JOB_ID')
         network_name = cfg.network_type
-        dataset_name = args.dataset_name if args.dataset_name is not None else cfg.dataset_name
-        
-        
+        dataset_name = args.dataset_name if args.dataset_name else cfg.dataset_name
+        unet_weights_precision = args.unet_weights_precision if args.unet_weights_precision else cfg.unet_weights_precision
+                
         if self.runtime_mode == 'train':
             if self.debug:
                 self.logging_dir = os.path.join(cfg.log_dir, network_name, dataset_name, 'debug_' + current_timestamp + '_' + slurm_job_id)
@@ -228,11 +251,13 @@ class FRI_DSTCM_worker:
         self.logger.info(f"runtime_mode: {self.runtime_mode}", main_process_only=self.accelerator.is_main_process)
         self.logger.info(f"dataset_name: {dataset_name}", main_process_only=self.accelerator.is_main_process)
         self.logger.info(f"device: {self.accelerator.device}", main_process_only=self.accelerator.is_main_process)
+        self.logger.info(f"unet_weights_precision: {unet_weights_precision}", main_process_only=self.accelerator.is_main_process)
+        self.logger.info(f'dump_sr: {self.dump_sr}', main_process_only=self.accelerator.is_main_process)
         
         
         device = self.accelerator.device
                         
-        self.pipe = prepare_pipe(cfg, device)
+        self.pipe = prepare_pipe(unet_weights_precision, device)
         self.tokenizer = self.pipe.tokenizer
         self.text_encoder = getattr(self.pipe, "text_encoder", None)
         self.text_encoder.to(device) if self.text_encoder is not None else None
@@ -254,6 +279,7 @@ class FRI_DSTCM_worker:
             self.null_text_emb = None
             
         self.logger.info(f"null_text_emb device and shape: {self.null_text_emb.device if self.null_text_emb is not None else None}, {self.null_text_emb.shape if self.null_text_emb is not None else None}", main_process_only=self.accelerator.is_main_process)
+
 
         self.wrapper = SDX4_FRI_DSTCM_Wrapper(self.pipe, use_qrm=self.cfg.use_qrm, K=self.cfg.K_neighbors,
                                               device =device,
@@ -284,10 +310,36 @@ class FRI_DSTCM_worker:
                 num_workers=self.cfg.num_workers,
                 dataset_name=dataset_name,
                 device=device,
+                debug=self.debug,
             )                    
-            self.logger.info(f"Train dataset size: {len(self.train_dataset)}", main_process_only=self.accelerator.is_main_process)            
-            self.optimizer, self.train_loader = self.accelerator.prepare(self.optimizer, self.train_loader)            
-        else:
+            self.logger.info(f"Train dataset size: {len(self.train_dataset)}", main_process_only=self.accelerator.is_main_process)      
+            self.val_loader, self.val_dataset = build_dataloader(
+                split="val",
+                batch_size=self.cfg.train_bsz,
+                num_workers=self.cfg.num_workers,
+                dataset_name=dataset_name,
+                device=device,
+                debug=self.debug,
+
+            )
+            self.logger.info(f"Validation dataset size: {len(self.val_dataset)}", main_process_only=self.accelerator.is_main_process)
+            self.optimizer, self.train_loader = self.accelerator.prepare(self.optimizer, self.train_loader)
+            self.val_loader = self.accelerator.prepare(self.val_loader)
+        else:                
+            self.test_loader, self.test_dataset = build_dataloader(
+                split="test",
+                batch_size=self.cfg.train_bsz,
+                num_workers=self.cfg.num_workers,
+                dataset_name=dataset_name,
+                device=device,
+                debug=self.debug,
+            )
+            self.logger.info(f"Test dataset size: {len(self.test_dataset)}", main_process_only=self.accelerator.is_main_process)
+                    
+            if self.test_loader is not None:
+                (self.test_loader) = self.accelerator.prepare(self.test_loader)
+
+            
             self.wrapper.conditioner.eval()
             self.wrapper.injector.eval()
             if self.cfg.use_qrm and getattr(self.wrapper.ref_builder, "qrm", None) is not None:
@@ -295,18 +347,6 @@ class FRI_DSTCM_worker:
                 
         self.wrapper = self.accelerator.prepare(self.wrapper)
         
-        self.test_loader, self.test_dataset = build_dataloader(
-            split="test",
-            batch_size=self.cfg.train_bsz,
-            num_workers=self.cfg.num_workers,
-            dataset_name=dataset_name,
-            device=device,
-        )
-        self.logger.info(f"Test dataset size: {len(self.test_dataset)}", main_process_only=self.accelerator.is_main_process)
-        
-        
-        if self.test_loader is not None:
-            (self.test_loader) = self.accelerator.prepare(self.test_loader)
 
         self.logger.info(f"Data loaders prepared.", main_process_only=self.accelerator.is_main_process)
         
@@ -316,6 +356,7 @@ class FRI_DSTCM_worker:
         # optional resume
         self.start_epoch = 0
         self.best_metric = float("-inf")
+        self.best_loss = float("inf")
         if self.cfg.resume_from:
             with self.accelerator.main_process_first():
                 self.start_epoch = self.load_checkpoint(self.cfg.resume_from, map_location=self.accelerator.device) + 1
@@ -361,7 +402,7 @@ class FRI_DSTCM_worker:
 
 
     # ---------- checkpoint ----------
-    def save_checkpoint(self, epoch, is_best = False, psnr : Optional[float] = None):
+    def save_checkpoint(self, epoch, is_best = False, psnr : Optional[float] = None, rec_loss : Optional[float] = None):
         if not self.accelerator.is_main_process:
             return
         os.makedirs(self.ckpt_out_dir, exist_ok=True)
@@ -384,6 +425,7 @@ class FRI_DSTCM_worker:
             "optimizer": self.optimizer.state_dict(),  # accelerate 处理过也能保存
             "epoch": epoch,
             "psnr": psnr,
+            "rec_loss": rec_loss,
         }
 
         
@@ -425,11 +467,12 @@ class FRI_DSTCM_worker:
 
         if self.best_metric is not None:
             self.best_metric = ckpt.get("psnr", float("-inf"))
+            self.best_loss = ckpt.get("rec_loss", float("inf"))
             self.logger.info(f"[CKPT] best_metric loaded <- {ckpt_path}")
             
         return int(ckpt.get("epoch", 0))
 
-    def training_step_with_injection(
+    def training_validation_step(
         self,
         t_int: torch.Tensor,
         a_bar: torch.Tensor,
@@ -438,6 +481,7 @@ class FRI_DSTCM_worker:
         center_idx: int,
         center_z_t: torch.Tensor,
         center_eps: torch.Tensor,
+        is_train: bool = True,
         ):
         """
         完整时序 teacher-forcing：
@@ -450,6 +494,12 @@ class FRI_DSTCM_worker:
         B = lr_seq_neighbors[0].shape[0]
         z_t_list, pred_eps_list = [], []
 
+        # if torch.isnan(a_bar).any() or (a_bar <= 0).any() or (a_bar > 1).any():
+        #     print(f"[DEBUG] ᾱ_t invalid: min={a_bar.min().item()}, max={a_bar.max().item()}")
+        # else:
+        #     print(f"[DEBUG] ᾱ_t stats: min={a_bar.min().item():.4f}, max={a_bar.max().item():.4f}")
+
+
         # ===== (1) Teacher-forcing 所有邻帧 j =====
         with torch.no_grad(), self.autocast_context:
             for idx, (lr_j, hr_j) in enumerate(zip(lr_seq_neighbors, hr_seq_neighbors)):
@@ -460,20 +510,19 @@ class FRI_DSTCM_worker:
                     # encode & 加噪
                     x0_j = vae_encode_img(self.pipe, hr_j)
                     eps_j = torch.randn_like(x0_j)
-                    z_j_t = a_bar.sqrt().view(B,1,1,1)*x0_j + (1.-a_bar).sqrt().view(B,1,1,1)*eps_j
-                    
-                z_j_t_scaled = self.pipe.scheduler.scale_model_input(
-                        z_j_t.to(self.pipe.unet.dtype), t_int
-                    )
+                    z_j_t = a_bar.sqrt().view(B,1,1,1)*x0_j + (1.-a_bar).sqrt().view(B,1,1,1)*eps_j                
 
+                # z_j_t_scaled = self.pipe.scheduler.scale_model_input(
+                #         z_j_t.to(self.pipe.unet.dtype), t_int
+                #     )
 
                 #  lr_j 也要先从 0~1 转为 [-1,1] 再 resize
                 lr_j_norm = lr_j * 2 - 1
 
                 # 拼接 LR → 7ch
                 lr_lat = F.interpolate(lr_j_norm, size=z_j_t.shape[-2:], mode="bilinear", align_corners=False)
-                # z_in = torch.cat([z_j_t, lr_lat], dim=1)
-                z_in = torch.cat([z_j_t_scaled, lr_lat], dim=1)
+                z_in = torch.cat([z_j_t, lr_lat], dim=1)
+                # z_in = torch.cat([z_j_t_scaled, lr_lat], dim=1)
                 # 预测 ε̂_{j,t}
                 pred_eps_j = self.pipe.unet(sample=z_in.to(dtype=self.pipe.unet.dtype), 
                                             timestep=t_int, 
@@ -481,39 +530,46 @@ class FRI_DSTCM_worker:
                                             class_labels=None).sample
                 z_t_list.append(z_j_t)
                 pred_eps_list.append(pred_eps_j)
-
+                
         try:
-
-            # ===== (2) warp 邻帧 → cond_i 并注册注入 =====
             real_wrapper = self.accelerator.unwrap_model(self.wrapper)
-            real_wrapper.build_and_register(
-                z_t_list=z_t_list,
-                lr_rgb_seq=lr_seq_neighbors,
-                pred_eps_list=pred_eps_list,
-                alpha_bar_t=a_bar,
-                timestep=t_int,
-                center_idx=center_idx,
-            )
+            if is_train:
+                real_wrapper.train()
+                context_grad = nullcontext()      
+            else:
+                real_wrapper.eval()
+                context_grad = torch.no_grad()
+                
+            with context_grad, self.autocast_context:
+                # ===== (2) warp 邻帧 → cond_i 并注册注入 =====                
+                real_wrapper.build_and_register(
+                    z_t_list=z_t_list,
+                    lr_rgb_seq=lr_seq_neighbors,
+                    pred_eps_list=pred_eps_list,
+                    alpha_bar_t=a_bar,
+                    timestep=t_int,
+                    center_idx=center_idx,
+                )
+                            
+                # ===== (3) 计算中心帧 i 的 ε̂_{i,t}, i == center_idx =====            
+                with self.autocast_context:
+                    z_i_t = z_t_list[center_idx]                   # 原始 latent
+                    # z_i_t_scaled = self.pipe.scheduler.scale_model_input(
+                    #         z_i_t.to(self.pipe.unet.dtype), t_int
+                    #     )
 
-            # ===== (3) 计算中心帧 i 的 ε̂_{i,t}, i == center_idx =====
-            with self.autocast_context:
-                z_i_t = z_t_list[center_idx]                   # 原始 latent
-                z_i_t_scaled = self.pipe.scheduler.scale_model_input(
-                        z_i_t.to(self.pipe.unet.dtype), t_int
-                    )
+                    lr_i = lr_seq_neighbors[center_idx]
+                    lr_i_norm = lr_i * 2 - 1
+                    lr_i_lat = F.interpolate(lr_i_norm, size=z_i_t.shape[-2:], mode="bilinear", align_corners=False)
 
-
-                lr_i = lr_seq_neighbors[center_idx]
-                lr_i_norm = lr_i * 2 - 1
-                lr_i_lat = F.interpolate(lr_i_norm, size=z_i_t.shape[-2:], mode="bilinear", align_corners=False)
-
-                # z_i_7ch = torch.cat([z_i_t, lr_i_lat], dim=1)
-                z_i_7ch = torch.cat([z_i_t_scaled, lr_i_lat], dim=1)
-                z_i_7ch = z_i_7ch.to(dtype=self.pipe.unet.dtype)
-                pred_eps_i = self.pipe.unet(sample=z_i_7ch, 
-                                              timestep=t_int, 
-                                              encoder_hidden_states=self.null_text_emb[:z_i_7ch.shape[0]], 
-                                              class_labels=None).sample
+                    z_i_7ch = torch.cat([z_i_t, lr_i_lat], dim=1)
+                    _must_finite(z_i_7ch, "z_i_7ch")
+                    # z_i_7ch = torch.cat([z_i_t_scaled, lr_i_lat], dim=1)
+                    z_i_7ch = z_i_7ch.to(dtype=self.pipe.unet.dtype)
+                    pred_eps_i = self.pipe.unet(sample=z_i_7ch, 
+                                                timestep=t_int, 
+                                                encoder_hidden_states=self.null_text_emb[:z_i_7ch.shape[0]], 
+                                                class_labels=None).sample
         finally:
             # ===== (4) 清理 hook =====
             real_wrapper.clear()
@@ -528,23 +584,36 @@ class FRI_DSTCM_worker:
         return 10.0 * torch.log10(torch.tensor(1.0) / torch.tensor(mse)).item()
 
 
-    def training_epoch(self, epoch):
+    def training_validation_epoch(self, data_loader, epoch, is_train: bool = True):
+        if is_train:
+            mode = "train"
+            self.wrapper.train()
+            torch.set_grad_enabled(True)
+            return self._run_epoch(mode, data_loader, epoch, is_train=True) 
+        else:
+            mode = "val"            
+            with torch.no_grad():
+                return self._run_epoch(mode, data_loader, epoch, is_train=False)
+
+    def _run_epoch(self, mode, data_loader, epoch, is_train: bool = True):
         total_loss = 0.0
         denoise_loss_epoch = 0.0
         band_loss_epoch = 0.0
+        rec_loss_epoch = 0.0
+            
         device = self.accelerator.device
-        for step, batch in enumerate(self.train_loader):
-
+        for step, batch in enumerate(data_loader):
             # ================== 原 _train_step 的全部内容 ================== #
-            lr_seq = batch["lr_seq"].to(device, dtype=self.data_precision, non_blocking=True) # [B,T,3,H//4,W//4]
-            hr_seq = batch["hr_seq"].to(device, dtype=self.data_precision, non_blocking=True) # [B,T,3,H,W]
-            lr_seq_full = split_seq(lr_seq) 
-            hr_seq_full = split_seq(hr_seq)
+            lr_seq = batch["lr_seq"].to(device, dtype=torch.float32, non_blocking=True) # [B,K,3,H//4,W//4]
+            hr_seq = batch["hr_seq"].to(device, dtype=torch.float32, non_blocking=True) # [B,K,3,H,W]
+            lr_seq_neighbors = split_seq(lr_seq) 
+            hr_seq_neighbors = split_seq(hr_seq)
+            center_idx = self.cfg.K_neighbors // 2  # 固定中心帧索引
             # print('shape of lr_seq: ', lr_seq.shape) # [B,T,3,H//4,W//4]
             # print(f'lr_seq_full length: {len(lr_seq_full)}; each shape: {[x.shape for x in lr_seq_full]}')  # length: 7; each shape: [torch.Size([B, 3, 64, 64]), 
 
-            lr_seq_neighbors, center_idx = pick_neighbors_fixed(lr_seq_full, self.cfg.K_neighbors, self.cfg.center_idx_mode)
-            hr_seq_neighbors, _          = pick_neighbors_fixed(hr_seq_full, self.cfg.K_neighbors, self.cfg.center_idx_mode)
+            # lr_seq_neighbors, center_idx = pick_neighbors_fixed(lr_seq_full, self.cfg.K_neighbors, self.cfg.center_idx_mode)
+            # hr_seq_neighbors, _          = pick_neighbors_fixed(hr_seq_full, self.cfg.K_neighbors, self.cfg.center_idx_mode)
             # print('center_idx in training:', center_idx) # 1 if K=3
             # print('lr_seq_neighbors.shape in training:', [x.shape for x in lr_seq_neighbors]) # [torch.Size([2, 3, 64, 64])..]
             
@@ -557,8 +626,10 @@ class FRI_DSTCM_worker:
             t_int = sample_timesteps(self.pipe.scheduler, x0_center.shape[0], device)
             center_z_t, center_eps_target, a_bar = construct_noisy_latent_and_etarget(x0_center, t_int, self.pipe.scheduler, device)
 
+            _must_finite(center_z_t, "center_z_t"); _must_finite(center_eps_target, "center_eps")
+            
             with self.accelerator.accumulate(self.wrapper):
-                center_eps_pred = self.training_step_with_injection(
+                center_eps_pred = self.training_validation_step(
                     t_int=t_int,
                     a_bar=a_bar,
                     lr_seq_neighbors=lr_seq_neighbors,
@@ -566,76 +637,96 @@ class FRI_DSTCM_worker:
                     center_idx=center_idx,
                     center_z_t=center_z_t,
                     center_eps=center_eps_target,
+                    is_train=is_train,
                 )
-
-                loss_denoise = F.mse_loss(
-                    center_eps_pred.to(torch.float32),
-                    center_eps_target.to(torch.float32)
-                )
+                center_eps_pred = center_eps_pred.to(torch.float32)
+                center_eps_target = center_eps_target.to(torch.float32)
+                loss_denoise = F.mse_loss(center_eps_pred, center_eps_target)
 
                 denoise_loss_epoch += loss_denoise.item()
                 loss = loss_denoise
 
-                if self.cfg.use_band_consistency:
+                if self.cfg.use_band_consistency or getattr(self.cfg, "use_rec_loss", False):
                     with self.autocast_context:
                         real_wrapper = self.accelerator.unwrap_model(self.wrapper)
                         # ε→x0
-                        center_x0_hat = real_wrapper.x0_from_eps(center_z_t, center_eps_pred, a_bar).to(torch.float32)
+                        center_x0_hat = real_wrapper.x0_from_eps(center_z_t.to(torch.float32),
+                                         center_eps_pred,
+                                         a_bar.to(torch.float32)).to(torch.float32)
+
                         with torch.no_grad():
                             center_hr_pred = vae_decode_latent(self.pipe, center_x0_hat).to(torch.float32)  # 不记录显存
-                        loss_band = self.band_reg(center_hr_pred, hr_center.to(torch.float32))
-                        band_loss_epoch += loss_band.item()
-                    loss = loss + self.cfg.band_weight * loss_band
+                            center_hr_pred = center_hr_pred.clamp(0, 1)
 
-                self.accelerator.backward(loss)
-                self.optimizer.step()
-                self.optimizer.zero_grad(set_to_none=True)
-            # ================== 训练逻辑结束 ================== #
+                        if self.cfg.use_band_consistency:
+                            loss_band = self.band_reg(center_hr_pred, hr_center.to(torch.float32))
+                            band_loss_epoch += loss_band.item()
+                        else:
+                            loss_band = 0.0
+                                
+                        if getattr(self.cfg, "use_rec_loss", False):
+                            loss_rec = F.l1_loss(center_hr_pred, hr_center.to(torch.float32))
+                        else:
+                            loss_rec = 0.0
+                            
+                    band_loss_epoch += loss_band.item()
+                    rec_loss_epoch += loss_rec.item()
+                                        
+                    loss = loss_denoise \
+                            + self.cfg.band_weight * loss_band \
+                            + self.cfg.rec_weight * loss_rec
+                                                                    
+                if is_train:
+                    self.accelerator.backward(loss)
+                    self.optimizer.step()
+                    self.optimizer.zero_grad(set_to_none=True)
+                # ================== 训练逻辑结束 ================== #
 
             total_loss += loss.item()
-
 
             # 日志输出
             if self.accelerator.is_main_process and step % self.cfg.log_every == 0:
                 self.logger.info(
-                    f"[epoch {epoch} | step {step}] loss={loss.item():.4f} denoise loss={loss_denoise.item():.4f}, band loss = {loss_band.item() if self.cfg.use_band_consistency else 0:.4f}",
+                    f"[epoch {epoch} {mode} | step {step}] loss={loss.item():.4f} denoise loss={loss_denoise.item():.4f}, band loss = {loss_band.item():.4f}, rec loss = {loss_rec.item():.4f}",
                     main_process_only=self.accelerator.is_main_process
                 )            
                 
             if step == 0 and epoch == self.start_epoch:
                 ## print gpu memory usage
                 max_mem = torch.cuda.max_memory_allocated(device=device) / (1024 ** 3)
-                self.logger.info(f"Max GPU memory allocated after first step: {max_mem:.2f} GB", main_process_only=self.accelerator.is_main_process)
+                self.logger.info(f"[epoch {epoch} {mode}, Max GPU memory allocated after first step: {max_mem:.2f} GB]", main_process_only=self.accelerator.is_main_process)
 
-            if self.debug and step >= 20:
-                break
-
-        return total_loss / max(1, len(self.train_loader)), denoise_loss_epoch / max(1, len(self.train_loader)), band_loss_epoch / max(1, len(self.train_loader))
+            # if self.debug and step >= 20:
+            #     break
+        
+        del lr_seq, hr_seq, lr_seq_neighbors, hr_seq_neighbors
+        
+        return total_loss / max(1, len(data_loader)), denoise_loss_epoch / max(1, len(data_loader)), band_loss_epoch / max(1, len(data_loader)), rec_loss_epoch / max(1, len(data_loader))
 
 
     def train_loop(self):
         self.logger.info("Starting training loop...", main_process_only=self.accelerator.is_main_process)
         
         for epoch in range(self.start_epoch, self.max_epochs):
-            if epoch < 15:
-                evaluate_every = 4
-            elif epoch < 30:
+            if epoch < 3:
                 evaluate_every = 2
+            elif epoch < 5:
+                evaluate_every = 1
             else:
                 evaluate_every = 1
-            sum_loss, denoise_loss, band_loss = self.training_epoch(epoch)
+            sum_loss, denoise_loss, band_loss, rec_loss = self.training_validation_epoch(self.train_loader, epoch, is_train=True)
             if self.accelerator.is_main_process:
-                self.logger.info(f"[Epoch {epoch}/{self.max_epochs}] avg_loss={sum_loss:.4f} denoise_loss={denoise_loss:.4f} band_loss={band_loss:.4f}", main_process_only=self.accelerator.is_main_process)
+                self.logger.info(f"[Epoch {epoch}/{self.max_epochs}] avg_loss={sum_loss:.4f} denoise_loss={denoise_loss:.4f} band_loss={band_loss:.4f} rec_loss={rec_loss:.4f}", main_process_only=self.accelerator.is_main_process)
 
             self.save_checkpoint(epoch)
-            if self.accelerator.is_main_process and self.test_loader is not None and (epoch + 1) % evaluate_every == 0 or self.debug:                
-                avg_psnr = self.evaluate()
-                self.logger.info(f"[EVAL] PSNR: {avg_psnr:.2f} dB")
-                if avg_psnr > self.best_metric:
-                    self.best_metric = avg_psnr
-                    self.save_checkpoint(epoch, is_best=True, psnr=avg_psnr)
-                    self.logger.info(f"[CKPT] New best model saved with PSNR={avg_psnr:.2f} dB", main_process_only=self.accelerator.is_main_process)
-            
+            if self.accelerator.is_main_process and self.val_loader is not None and (epoch + 1) % evaluate_every == 0 or self.debug:
+                sum_loss, denoise_loss, band_loss, rec_loss = self.training_validation_epoch(self.val_loader, epoch, is_train=False)
+
+                if rec_loss < self.best_loss:
+                    self.best_loss = rec_loss
+                    self.save_checkpoint(epoch, is_best=True, rec_loss=rec_loss)
+                    self.logger.info(f"[CKPT] New best model saved with rec_loss={rec_loss:.4f}", main_process_only=self.accelerator.is_main_process)
+
             if self.debug:
                 break
             self.logger.info(f"\n", main_process_only=self.accelerator.is_main_process)
@@ -729,28 +820,44 @@ class FRI_DSTCM_worker:
         return sr_center, center_idx
 
     @torch.no_grad()
-    def eval_step_per_sequence(self, lr_seq_full, num_inference_steps=75):
+    def eval_step_per_sequence(self, lr_seq_path, hr_seq_path, num_inference_steps=75, step = 0):
         """
-        lr_seq_full: List[T] of tensors, each [B,3,H,W]
+        lr_seq_full: # [B, T] 的列表
         return: List[T] of SR results, each [B,3,H,W]
         """
-        sr_results = []
 
-        T = len(lr_seq_full)
-        K = getattr(getattr(self.wrapper, "module", self.wrapper), "K", self.cfg.K_neighbors)
-
+        T = len(lr_seq_path)
+        PSNRs = []
+        device = self.accelerator.device
+        lr_scale = 4 if self.cfg.dataset_name == 'Vimeo-90K' else 1
         for i in range(T):
             # 取得以第 i 帧为中心的 K 邻域
-            lr_neighbors, center_idx = pick_neighbors_for_eval(lr_seq_full, i, K)
+            lr_neighbors = pick_neighbors_for_eval(lr_seq_path, i, device, to_neg1_pos1=False, scale=lr_scale)
+            # hr_neighbors = pick_neighbors_for_eval(hr_seq_path, i, device, dataset_name=self.cfg.dataset_name, to_neg1_pos1=False)
+            sr_gt = _to_tensor(hr_seq_path[i], to_neg1_pos1=False).to(device, dtype=torch.float32, non_blocking=True)
+            
+            sr_pred, _ = self.eval_step_per_frame(lr_neighbors, num_inference_steps)
+            sr_pred = sr_pred.clamp(0, 1).to(torch.float32)
+                        
+            PSNRs.append(self._psnr(sr_pred, sr_gt))
 
-            sr_center_pred, _ = self.eval_step_per_frame(lr_neighbors, num_inference_steps)
+            if self.debug and i >= 2:
+                break
+                                
+            if self.dump_sr and self.accelerator.is_main_process:
+                sr_img_np = (sr_pred.cpu().numpy().transpose(1,2,0) * 255).astype(np.uint8)
+                img_pil = Image.fromarray(sr_img_np)
+                img_pil.save(os.path.join(self.dump_dir, f"{step:03d}_{i:03d}_SR.png"))
 
-            sr_results.append(sr_center_pred)
+                lr_img_np = (sr_gt.cpu().numpy().transpose(1,2,0) * 255).astype(np.uint8)
+                img_pil = Image.fromarray(lr_img_np)
+                img_pil.save(os.path.join(self.dump_dir, f"{step:03d}_{i:03d}_LR.png"))
+
 
             if self.debug and i >= 2:
                 break
                 
-        return sr_results
+        return PSNRs
 
 
     @torch.no_grad()
@@ -763,37 +870,20 @@ class FRI_DSTCM_worker:
         self.logger.info(f"Starting evaluation with num_inference_steps={num_inference_steps}...", main_process_only=self.accelerator.is_main_process)
         device = self.accelerator.device
         for step, batch in enumerate(self.test_loader):
-            lr_seq = batch["lr_seq"].to(device, dtype=self.data_precision, non_blocking=True)
-            hr_seq = batch["hr_seq"].to(device, dtype=self.data_precision, non_blocking=True)
-            lr_seq_full = split_seq(lr_seq)
-            hr_seq_full = split_seq(hr_seq)
+            lr_seq_path = batch["lr_seq_path"] # [B, T] 的列表
+            hr_seq_path = batch["hr_seq_path"] # [B, T] 的列表
+            # lr_seq_full = split_seq(lr_seq)
+            # hr_seq_full = split_seq(hr_seq)
             # print('shape of lr_seq: ', lr_seq.shape) 
             # print('shape of hr_seq: ', hr_seq.shape)
-            sr_seq_full = self.eval_step_per_sequence(lr_seq_full, num_inference_steps)  # List[T]
+            psnr = self.eval_step_per_sequence(lr_seq_path, hr_seq_path, num_inference_steps, step)  # List[T]
 
-            for t in range(len(sr_seq_full)):
-                I_pred = sr_seq_full[t].to(torch.float32)
-                I_gt   = hr_seq_full[t].to(torch.float32)
-                PSNRs.append(self._psnr(I_pred, I_gt))
-                
-                if self.debug and step >= 2:
-                    break
-                                    
-                if self.dump_sr and self.accelerator.is_main_process:
-                    sr_img = sr_seq_full[t][0]  # [3,H,W]
-                    sr_img_np = (sr_img.cpu().numpy().transpose(1,2,0) * 255).astype(np.uint8)
-                    img_pil = Image.fromarray(sr_img_np)
-                    img_pil.save(os.path.join(self.dump_dir, f"{step:03d}_{t:03d}_SR.png"))
-
-                    lr_img = lr_seq_full[t][0]  # [3,H,W]
-                    lr_img_np = (lr_img.cpu().numpy().transpose(1,2,0) * 255).astype(np.uint8)
-                    img_pil = Image.fromarray(lr_img_np)
-                    img_pil.save(os.path.join(self.dump_dir, f"{step:03d}_{t:03d}_LR.png"))
+            PSNRs += psnr
 
                         # 日志输出
             if self.accelerator.is_main_process and step % self.cfg.log_every == 0:
                 self.logger.info(
-                    f"[step {step}] Current PSNR: {PSNRs[-1]:.2f} dB",
+                    f"[step {step}] Current PSNR: {psnr[-1]:.2f} dB",
                     main_process_only=self.accelerator.is_main_process
                 )
 
@@ -812,6 +902,8 @@ if __name__ == "__main__":
     parser.add_argument('--debug', action='store_true', help='Enable debug mode with reduced settings')
     parser.add_argument('--runtime', type=str, default='train', help='Runtime mode: train or test')
     parser.add_argument('--dataset_name', type=str, default=None, help='Name of the dataset to use for training/testing')
+    parser.add_argument('--finetune', action='store_true', help='Whether to finetune from a pre-trained checkpoint')
+    parser.add_argument('--unet_weights_precision', type=str, default=None, help='Precision for UNet weights: fp16 or bf16')
     parser.add_argument('--dump_sr', action='store_true', help='Dump super-resolved videos during evaluation')
     
     args = parser.parse_args()

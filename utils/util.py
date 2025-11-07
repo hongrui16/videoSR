@@ -1,6 +1,9 @@
 from typing import List, Tuple, Union
 import torch
-
+import os
+import numpy as np
+from PIL import Image
+import torch.nn.functional as F 
 
 def split_seq(x: Union[List[torch.Tensor], torch.Tensor]) -> List[torch.Tensor]:
     if isinstance(x, list):
@@ -56,29 +59,45 @@ def pick_neighbors_fixed(
 
     return neighbors, center_idx
 
-def pick_neighbors_for_eval(seq, center, K = 3):
+
+def _to_tensor(img_path, to_neg1_pos1=False, scale =1):
+    img = np.array(Image.open(img_path).convert("RGB"))
+    t = torch.from_numpy(img).permute(2,0,1).float() / 255.0
+    if scale !=1:
+        C, H, W = t.shape
+        t = F.interpolate(t.unsqueeze(0), size=(H//scale, W//scale), mode="bicubic", align_corners=False).squeeze(0)
+    return t * 2 - 1 if to_neg1_pos1 else t
+
+def pick_neighbors_for_eval(seq_paths, center, device, to_neg1_pos1=False, scale=1):
     """
-    专用于 eval 的邻居采样：
-    - seq: List[T] of tensors, each [B,3,H,W]
-    - center: 指定中心帧 index（0 ≤ center < T）
-    - K: 固定邻居帧数量（如 3, 5, 7）
-    返回：
-    - neighbors: List[K] of tensors
-    - center_idx: int，中心帧在 neighbors 中的位置（始终为 K//2）
+    seq_paths: List[List[str]]  # 形状是 [B, T]，每个元素是图片路径，例如:
+                                # [["path/000/im1.png", ..., "im7.png"],  # 第一个视频
+                                #  ["path/001/im1.png", ..., "im7.png"]]  # 第二个视频
+    center:      当前中心帧 (0-based)
+    dataset_name: "REDS" or "Vimeo90K"
+    返回:
+        batch frames_3: Tensor [B, 3, 3, H, W]
     """
-    T = len(seq)
-    half = K // 2
+    batch_tensors = []
+    for frame_list in seq_paths:  # frame_list: List[str] 长度 T
+        T = len(frame_list)
+        if T == 0:
+            raise ValueError("Empty frame list in seq_paths.")
+        if T == 1:
+            ids = [0, 0, 0]
+        else:
+            if center <= 0:
+                ids = [0, 0, 1]
+            elif center >= T - 1:
+                ids = [T - 2, T - 1, T - 1]
+            else:
+                ids = [center - 1, center, center + 1]
 
-    neighbors = []
-    for offset in range(-half, half + 1):
-        idx = center + offset
-        # 边界补齐策略：超出边界就复制最近的合法帧
-        if idx < 0:
-            idx = 0
-        elif idx >= T:
-            idx = T - 1
-        neighbors.append(seq[idx])
+        imgs = [_to_tensor(frame_list[i], to_neg1_pos1, scale) for i in ids]  # 3 × [3,H,W]
 
-    center_idx = half  # 中心永远落在 neighbors 的中间位置
-    return neighbors, center_idx
+        # 可选：确保同一 batch 内尺寸一致（如果你预先裁剪/对齐了就不需要）
+        # 这里假设序列内各帧同尺寸，直接堆叠：
+        clip = torch.stack(imgs, dim=0)  # [3,3,H,W]
+        batch_tensors.append(clip)
 
+    return torch.stack(batch_tensors, dim=0).to(device)  # [B,3,3,H,W]

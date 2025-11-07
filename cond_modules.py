@@ -196,8 +196,9 @@ class DSTCMGate(nn.Module):
 
     def forward(self, t_emb, snr_emb, feats: Dict[str, torch.Tensor]):
         # FIX: 强制统一 dtype 到 feats 的 dtype（AMP 下 Linear 为 fp32）
-        base_dtype = next(iter(feats.values())).dtype
-        x = torch.cat([t_emb, snr_emb], dim=-1) if self.use_snr else t_emb
+        # base_dtype = next(iter(feats.values())).dtype
+        base_dtype = torch.float32
+        x = torch.cat([t_emb, snr_emb], dim=-1).to(torch.float32) if self.use_snr else t_emb
         x = x.to(dtype=base_dtype)
 
         out = {}
@@ -278,9 +279,9 @@ class FRI_DSTCM_Conditioner(nn.Module):
 
         cond_i_f32 = cond_i.float()
         low, mid, high = self.lap(cond_i_f32)
-        low = low.to(dtype=cond_i.dtype)
-        mid = mid.to(dtype=cond_i.dtype)
-        high = high.to(dtype=cond_i.dtype)
+        # low = low.to(dtype=cond_i.dtype)
+        # mid = mid.to(dtype=cond_i.dtype)
+        # high = high.to(dtype=cond_i.dtype)
         F_low = self.enc_low(low)
         F_mid = self.enc_mid(mid)
         F_high = self.enc_high(high)
@@ -342,14 +343,26 @@ class UNetMultiScaleInjector(nn.Module):
     def register_injection(self, residuals: Dict[str, torch.Tensor]):
         def make_hook(name, key):
             def hook(module, inputs, output):
-                R = residuals[key].to(dtype=output.dtype, device=output.device)
+                # 1) 保留 UNet 原来的 dtype/device
+                out_dtype = output.dtype       # e.g. torch.float16
+                out_device = output.device     # e.g. cuda:0
+
+                # R = residuals[key].to(dtype=output.dtype, device=output.device)
+                # 2) residual 转成 float32 计算（因为更稳定）
+                R = residuals[key].to(dtype=torch.float32, device=out_device)
+
+
                 # 尺寸对齐
                 if R.shape[-2:] != output.shape[-2:]:
                     R = F.interpolate(R, size=output.shape[-2:], mode="bilinear", align_corners=False)
+                    
                 # 通道映射（已提前创建）
-                conv = self._proj_convs[f"{key}_{name}"].to(device=output.device, dtype=output.dtype)
+                conv = self._proj_convs[f"{key}_{name}"].to(device=output.device, dtype=torch.float32)
                 R = conv(R)
-                return output + R
+                
+                # 转回 output 的 dtype（fp16）
+                return output + R.to(dtype=out_dtype)
+            
             return hook
 
         for i, up in enumerate(self.unet.up_blocks):
@@ -391,6 +404,12 @@ class ReferenceBuilder:
     ) -> torch.Tensor:
         # 1) 解码所有 x0 → HR RGB [0,1]
         hr_list = [self.vae_decode(z) for z in pred_x0_list]  # each [B,3,H,W_hr], generated hr frames at center_idx and its neighbor indices
+        
+        # for i, h in enumerate(hr_list):
+        #     if torch.isnan(h).any():
+        #         print(f"NaN in hr_list[{i}] after VAE decode") # NaN in hr_list[0] after VAE decode
+
+
         B, _, H_hr, W_hr = hr_list[center_idx].shape
 
         # 2) 构造到 HR 的 flow：先在 LR 上估计，再上采到 HR，并做像素单位缩放
@@ -413,6 +432,12 @@ class ReferenceBuilder:
             flow_hr[:, 1, ...] *= scale_y
 
             hrk_w = grid_warp(hrk, flow_hr)
+            
+            hrk_w = grid_warp(hrk, flow_hr)
+            # if torch.isnan(hrk_w).any():
+            #     print(f"NaN after warping frame {k} --> center frame")
+
+
             hrk_w = hrk_w.to(dtype=hrk.dtype)
 
             if self.use_qrm:
@@ -455,12 +480,13 @@ class SDX4_FRI_DSTCM_Wrapper(nn.Module):
         for p in self.vae.parameters():
             p.requires_grad_(False)
 
+        logger.info("SDX4_FRI_DSTCM_Wrapper: UNet dtype {}, VAE dtype {}".format(self.unet.dtype, self.vae.dtype), main_process_only=accelerator.is_main_process)
         self.logger = logger
         self.accelerator = accelerator
         B = 1  # dummy batch size for null text embedding, only used during initialization
+        self.K = K
     
-        self.null_encoder_hidden_states = null_text_emb  # SD-upscale 没 text encoder 也允许这样
-
+        self.null_encoder_hidden_states =  null_text_emb.to(device=device, dtype=self.unet.dtype)  # SD-upscale 没 text encoder 也允许这样
         self.logger.info(f"null_encoder_hidden_states shape: {self.null_encoder_hidden_states.shape}", main_process_only=self.accelerator.is_main_process)
 
         self.flow_estimator = TVRaftBackend(device=next(self.unet.parameters()).device).to(dtype=torch.float32)
@@ -479,35 +505,27 @@ class SDX4_FRI_DSTCM_Wrapper(nn.Module):
             scale_specs[f"s{f}"] = ScaleSpec(ch=ch, factor=f)
 
 
-        self.conditioner = FRI_DSTCM_Conditioner(n_rgbk=3 * K, scale_specs=scale_specs)
-        self.conditioner.to(device).to(self.unet.dtype)
+        self.conditioner = FRI_DSTCM_Conditioner(n_rgbk=3 * K, scale_specs=scale_specs).to(device=device, dtype=torch.float32)
 
         
-        self.snr_mlp = nn.Sequential(nn.Linear(1, 256), nn.SiLU(), nn.Linear(256, 256))
-        self.snr_mlp.to(device).to(self.unet.dtype)
+        self.snr_mlp = nn.Sequential(nn.Linear(1, 256), nn.SiLU(), nn.Linear(256, 256)).to(device=device, dtype=torch.float32)
 
-        def vae_decode_fn(latent_4chw):
-            latent_4chw = latent_4chw.to(dtype=self.pipe.vae.dtype, device=next(self.unet.parameters()).device)
-            out = self.vae.decode(
-                latent_4chw / self.pipe.vae.config.scaling_factor, return_dict=False
-            )[0]  # [-1,1]
-            return (out.clamp(-1, 1) + 1) / 2.0
-
-        self.ref_builder = ReferenceBuilder(vae_decode_fn, flow_estimator=self.flow_estimator, use_qrm=use_qrm, device=next(self.unet.parameters()).device, weights_precision=self.unet.dtype)
-        self.K = K
+        self.ref_builder = ReferenceBuilder(self.vae_decode_fn, flow_estimator=self.flow_estimator, use_qrm=use_qrm, device=next(self.unet.parameters()).device,
+                                            weights_precision=torch.float32)
+        
         
         # 关键：scale_keys 以 factor 升序（面积从大到小）传入
         self.injector = UNetMultiScaleInjector(self.unet, scale_keys=list(scale_specs.keys()))
-
-        self.injector.to(device).to(self.unet.dtype)
         self.injector.probe()
 
+
+        logger.info(f"UNet dtype after injector probe: {next(self.unet.parameters()).dtype}", main_process_only=self.accelerator.is_main_process)
+        
         with torch.no_grad():
             device = next(self.unet.parameters()).device
-            dtype  = next(self.unet.parameters()).dtype
             H = W = 64  # 任意 8 的倍数即可
             in_ch = getattr(self.unet.config, "in_channels", 7)
-            dummy = torch.zeros(B, in_ch, H, W, device=device, dtype=dtype)
+            dummy = torch.zeros(B, in_ch, H, W, device=device, dtype=self.unet.dtype)
             self.logger.info(f"dummy shape, device, and dtype: {dummy.shape}, {dummy.device}, {dummy.dtype}", main_process_only=self.accelerator.is_main_process)
             # 兼容 upscaler：没有文本条件
             t0 = torch.zeros(B, dtype=torch.long, device=device)
@@ -515,19 +533,36 @@ class SDX4_FRI_DSTCM_Wrapper(nn.Module):
                           timestep=t0, 
                           encoder_hidden_states=self.null_encoder_hidden_states[:B],
                           class_labels=None)
+            
         self.injector.resolve(scale_specs)
 
-        self.unet.eval()
-        for p in self.unet.parameters():
-            p.requires_grad_(False)
-            
+        for name, conv in self.injector._proj_convs.items():
+            self.injector._proj_convs[name] = conv.to(device=device, dtype=torch.float32)
+
         for name, param in self.injector.named_parameters():
             if "proj_convs" in name:
                 param.requires_grad_(True)
             else:
                 param.requires_grad_(False)
 
+        logger.info("Initialized SDX4_FRI_DSTCM_Wrapper.", main_process_only=self.accelerator.is_main_process)
 
+    @torch.no_grad()
+    def vae_decode_fn(self, latent_4chw: torch.Tensor):
+        """
+        Decode latent → RGB (0~1), assuming VAE is already in FP32.
+        """
+        # 1) latent 必须 FP32，否则 FP16 下除 scaling_factor 会出现溢出或 NaN
+        latent_4chw = latent_4chw.to(device=next(self.unet.parameters()).device, dtype=torch.float32)
+
+        # 2) 归一化 + 解码
+        out = self.vae.decode(latent_4chw / self.pipe.vae.config.scaling_factor, return_dict=False)[0]  # [-1,1]
+
+        # 3) Clamp 到 0~1，防止极端值
+        out = (out.clamp(-1, 1) + 1) / 2.0  # -> [0,1]
+
+        # 4) 输出保持 FP32
+        return out
 
 
     @staticmethod
@@ -541,14 +576,17 @@ class SDX4_FRI_DSTCM_Wrapper(nn.Module):
             pred_eps:   [B,4,h,w]
             alpha_bar_t:[B]
         """
+        eps = 1e-5
         z_t = z_t.to(torch.float32)
         pred_eps = pred_eps.to(torch.float32)
         alpha_bar_t = alpha_bar_t.to(torch.float32)
 
-        a_sqrt = alpha_bar_t.sqrt()[:, None, None, None]
-        one_minus_a_sqrt = (1.0 - alpha_bar_t).sqrt()[:, None, None, None]
+        a_sqrt = (alpha_bar_t + eps).sqrt()[:, None, None, None]
+        one_minus_a_sqrt = (1.0 - alpha_bar_t + eps).sqrt()[:, None, None, None]
 
-        return (z_t - one_minus_a_sqrt * pred_eps) / a_sqrt  # output fp32
+        x0 = (z_t - one_minus_a_sqrt * pred_eps) / a_sqrt  # output fp32
+        return x0.clamp(-3, 3)  # 防止极端值
+
 
 
     def build_and_register(
@@ -563,10 +601,11 @@ class SDX4_FRI_DSTCM_Wrapper(nn.Module):
         # 1) ε̂_{j,t} → x̂_{j,0}（latent）
         pred_x0_list = [ self.x0_from_eps(z_j_t, eps_j_t, alpha_bar_t)
                          for z_j_t, eps_j_t in zip(z_t_list, pred_eps_list) ]
-
+            
         # 2) 解码 + LR 光流 j→i 放大/对齐，拼 cond_i
         with torch.no_grad():
             cond_i = self.ref_builder(pred_x0_list, lr_rgb_seq, center_idx=center_idx)
+
 
         # 3) DS-TCM 生成多尺度残差并注入
         # FIX: 统一 dtype

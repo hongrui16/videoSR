@@ -39,32 +39,7 @@ def _to_tensor_and_norm(img_np: np.ndarray, to_neg1_pos1: bool=False) -> torch.T
         t = t * 2 - 1
     return t
 
-def _pil_bicubic_resize(img_np: np.ndarray, size_wh: Tuple[int,int]) -> np.ndarray:
-    return np.array(Image.fromarray(img_np).resize(size_wh, Image.BICUBIC))
 
-def _center_crop_np(img: np.ndarray, crop_h: int, crop_w: int) -> np.ndarray:
-    H, W = img.shape[:2]
-    top = max(0, (H - crop_h)//2)
-    left = max(0, (W - crop_w)//2)
-    return img[top:top+crop_h, left:left+crop_w, :]
-
-
-def _pad_to_min_size_edge(img: np.ndarray, min_h: int, min_w: int) -> np.ndarray:
-    H, W = img.shape[:2]
-    pad_h = max(0, min_h - H)
-    pad_w = max(0, min_w - W)
-    if pad_h == 0 and pad_w == 0:
-        return img
-    out = np.zeros((H+pad_h, W+pad_w, 3), dtype=img.dtype)
-    out[:H, :W] = img
-    return out
-
-
-def mirror_pad_7_to_14(frames_7: List[np.ndarray]) -> List[np.ndarray]:
-    """[1..7, 7..1] 的镜像扩展"""
-    return frames_7 + frames_7[::-1]
-
-IDX_7TO14 = torch.tensor([0,1,2,3,4,5,6,5,4,3,2,1,0,1], dtype=torch.long)
 
 
 # ===================== Dataset =====================
